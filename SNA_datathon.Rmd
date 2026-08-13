@@ -5,7 +5,417 @@ date: "2026-08-13"
 output: html_document
 ---
 
-```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE)
+# Data Prep
+
+```{r setup, message=FALSE}
+library(data.table)
+
+data_dir <- "C:/Users/peera/Downloads/Datathon Data"        # <-- EDIT to your folder
+years    <- setdiff(2005:2021, 2010)   # 2010 not available
+
+files <- file.path(data_dir, paste0(years, "Combined.csv"))
+names(files) <- years
+
+missing_files <- files[!file.exists(files)]
+if (length(missing_files) > 0) {
+  stop("Not found:\n  ", paste(missing_files, collapse = "\n  "))
+}
 ```
 
+
+```{r check-headers}
+headers <- lapply(files, function(f) names(fread(f, nrows = 0)))
+same <- vapply(headers, identical, logical(1), y = headers[[1]])
+
+if (all(same)) {
+  cat("All", length(files), "files share the same", length(headers[[1]]), "columns.\n")
+} else {
+  cat("Headers differ in:", paste(names(headers)[!same], collapse = ", "), "\n")
+  print(setdiff(unique(unlist(headers)), headers[[1]]))
+}
+```
+
+```{r col-spec}
+col_classes <- c(
+  "Domain Code" = "character", "Domain" = "character",
+  "Reporter Country Code (M49)" = "character", "Reporter Countries" = "character",
+  "Partner Country Code (M49)"  = "character", "Partner Countries"  = "character",
+  "Element Code" = "character", "Element" = "character",
+  "Item Code (CPC)" = "character", "Item" = "character",
+  "Year Code" = "character", "Year" = "integer",
+  "Unit" = "character", "Value" = "numeric",
+  "Flag" = "character", "Flag Description" = "character"
+)
+
+rename_map <- c(
+  "Domain Code" = "domain_code", "Domain" = "domain",
+  "Reporter Country Code (M49)" = "reporter_m49", "Reporter Countries" = "reporter",
+  "Partner Country Code (M49)"  = "partner_m49",  "Partner Countries"  = "partner",
+  "Element Code" = "element_code", "Element" = "element",
+  "Item Code (CPC)" = "item_code", "Item" = "item",
+  "Year Code" = "year_code", "Year" = "year",
+  "Unit" = "unit", "Value" = "value",
+  "Flag" = "flag", "Flag Description" = "flag_description"
+)
+```
+
+```{r import}
+read_fao_year <- function(path, file_year) {
+  dt <- fread(path,
+              colClasses   = col_classes,
+              na.strings   = c("", "NA", "N/A"),
+              encoding     = "UTF-8",   # try "Latin-1" if country names look mangled
+              check.names  = FALSE,
+              showProgress = FALSE)
+  setnames(dt, names(rename_map), unname(rename_map), skip_absent = TRUE)
+  dt[, file_year := as.integer(file_year)]
+  dt[]
+}
+
+trade_list <- Map(read_fao_year, files, years)
+
+print(data.table(year = years, n_rows = vapply(trade_list, nrow, integer(1))))
+
+trade <- rbindlist(trade_list, use.names = TRUE, fill = TRUE)
+rm(trade_list); invisible(gc())
+
+cat(format(nrow(trade), big.mark = ","), "rows x", ncol(trade), "columns\n")
+str(trade)
+```
+
+```{r checks}
+unique(trade[, .(element_code, element, unit)])[order(element_code)]
+
+dcast(trade[, .N, by = .(item, year)], item ~ year, value.var = "N", fill = 0)
+
+trade[, .N, by = .(flag, flag_description)][order(-N)]
+
+trade[, .(n_na = sum(is.na(value)), n_zero = sum(value == 0, na.rm = TRUE))]
+
+trade[, .N, by = .(reporter, partner, item, element_code, year)][N > 1]
+```
+
+```{r units}
+trade[, value_head := fcase(
+  unit == "An",      value,
+  unit == "1000 An", value * 1000,
+  default = NA_real_
+)]
+trade[, value_tonnes := fifelse(unit == "t", value, NA_real_)]
+trade[, flow := fifelse(grepl("^Export", element), "export", "import")]
+
+saveRDS(trade, "trade_2005_2021.rds")
+```
+
+# Global SNA
+
+```{r build-flows}
+library(igraph)
+
+qty <- trade[flow == "import" & !is.na(value_head) & value_head > 0]
+
+# Must return zero rows. If not, a flow is recorded in both "An" and
+# "1000 An" and you'd double-count it below.
+qty[, .N, by = .(reporter_m49, partner_m49, item, year)][N > 1]
+
+qty[reporter_m49 == partner_m49, .N]   # self-trade, should be 0
+```
+
+```{r check-entities}
+sort(unique(c(qty$reporter, qty$partner)))
+```
+
+```{r diagnose-selfloops}
+self <- qty[reporter_m49 == partner_m49]
+
+# Do the two sides carry the same country label, or different ones?
+self[, .N, by = .(reporter_m49, reporter, partner)][order(-N)]
+
+self[, .N, by = .(item, year)][order(-N)]
+self[, .(n = .N, head = sum(value_head)), by = .(reporter, flag_description)]
+```
+
+```{r drop-selfloops}
+n_self <- qty[reporter_m49 == partner_m49, .N]
+qty <- qty[reporter_m49 != partner_m49]
+cat("Dropped", n_self, "self-trade records\n")
+
+drop_m49 <- c()   # <-- fill in aggregate codes found above
+qty <- qty[!reporter_m49 %in% drop_m49 & !partner_m49 %in% drop_m49]
+
+# Edge weight = number of distinct species-year flows on that ordered pair
+edges <- qty[, .(weight    = .N,
+                 head      = sum(value_head),
+                 n_species = uniqueN(item),
+                 n_years   = uniqueN(year)),
+             by = .(from = partner_m49, to = reporter_m49)]
+
+nodes <- unique(rbindlist(list(
+  qty[, .(m49 = reporter_m49, name = reporter)],
+  qty[, .(m49 = partner_m49,  name = partner)]
+)), by = "m49")
+
+g <- graph_from_data_frame(edges, directed = TRUE, vertices = nodes)
+g
+
+g <- simplify(g, remove.multiple = FALSE, remove.loops = TRUE)
+any(which_loop(g))   # FALSE
+```
+
+```{r rebuild-nodes}
+nodes <- unique(rbindlist(list(
+  qty[, .(m49 = reporter_m49, country = reporter)],
+  qty[, .(m49 = partner_m49,  country = partner)]
+)), by = "m49")
+
+g <- graph_from_data_frame(edges, directed = TRUE, vertices = nodes)
+g <- simplify(g, remove.multiple = FALSE, remove.loops = TRUE)
+
+V(g)$in_deg      <- degree(g, mode = "in")
+V(g)$in_deg_norm <- degree(g, mode = "in", normalized = TRUE)
+V(g)$in_freq     <- strength(g, mode = "in", weights = E(g)$weight)
+V(g)$in_head     <- strength(g, mode = "in", weights = E(g)$head)
+
+node_tbl <- data.table(
+  m49         = V(g)$name,
+  country     = V(g)$country,
+  in_deg      = V(g)$in_deg,
+  in_deg_norm = V(g)$in_deg_norm,
+  in_freq     = V(g)$in_freq,
+  in_head     = V(g)$in_head
+)
+setorder(node_tbl, -in_deg)
+head(node_tbl, 20)
+```
+
+```{r diagnose-codes}
+code_map <- unique(rbindlist(list(
+  qty[, .(m49 = reporter_m49, country = reporter)],
+  qty[, .(m49 = partner_m49,  country = partner)]
+)))
+
+# Countries carrying more than one code
+dupes <- code_map[, .N, by = country][N > 1]
+dupes[order(-N)]
+code_map[country %in% dupes$country][order(country)]
+
+# Are the two columns even formatted the same way?
+head(sort(unique(qty$reporter_m49)), 15)
+head(sort(unique(qty$partner_m49)),  15)
+```
+
+```{r normalise-codes}
+norm_m49 <- function(x) {
+  x <- gsub("^'|\\s+", "", x)
+  ifelse(grepl("^[0-9]+$", x), sprintf("%03d", suppressWarnings(as.integer(x))), x)
+}
+qty[, reporter_m49 := norm_m49(reporter_m49)]
+qty[, partner_m49  := norm_m49(partner_m49)]
+```
+
+```{r verify-codes}
+code_map <- unique(rbindlist(list(
+  qty[, .(m49 = reporter_m49, country = reporter)],
+  qty[, .(m49 = partner_m49,  country = partner)]
+)))
+
+code_map[, .N, by = country][N > 1]   # one country, several codes — expect empty
+code_map[, .N, by = m49][N > 1]       # one code, several names — read below
+```
+
+```{r recheck}
+qty[reporter_m49 == partner_m49, .N]                                   # self-trade
+qty[, .N, by = .(reporter_m49, partner_m49, item, year)][N > 1]        # duplicates
+```
+
+```{r rebuild-all}
+code_map <- unique(rbindlist(list(
+  qty[, .(m49 = reporter_m49, country = reporter)],
+  qty[, .(m49 = partner_m49,  country = partner)]
+)))
+
+code_map[, .N, by = country][N > 1]   # expect empty after normalisation
+code_map[, .N, by = m49][N > 1]       # relabels (Czechia/Czech Republic) — ok
+
+country_labels <- code_map[, .(country = country[1]), by = m49]
+
+qty[reporter_m49 == partner_m49, .N]   # recount: higher than 126
+qty <- qty[reporter_m49 != partner_m49]
+
+edges <- qty[, .(weight    = .N,
+                 head      = sum(value_head),
+                 n_species = uniqueN(item),
+                 n_years   = uniqueN(year)),
+             by = .(from = partner_m49, to = reporter_m49)]
+
+nodes <- country_labels[m49 %in% unique(c(edges$from, edges$to))]
+
+g <- graph_from_data_frame(edges, directed = TRUE, vertices = nodes)
+g <- simplify(g, remove.multiple = FALSE, remove.loops = TRUE)
+
+V(g)$in_deg      <- degree(g, mode = "in")
+V(g)$in_deg_norm <- degree(g, mode = "in", normalized = TRUE)
+V(g)$in_freq     <- strength(g, mode = "in", weights = E(g)$weight)
+V(g)$in_head     <- strength(g, mode = "in", weights = E(g)$head)
+
+node_tbl <- data.table(
+  m49         = V(g)$name,
+  country     = V(g)$country,
+  in_deg      = V(g)$in_deg,
+  in_deg_norm = V(g)$in_deg_norm,
+  in_freq     = V(g)$in_freq,
+  in_head     = V(g)$in_head
+)
+setorder(node_tbl, -in_deg)
+
+vcount(g); ecount(g)
+head(node_tbl, 20)
+```
+
+```{r density}
+ecount(g); edge_density(g)
+summary(E(g)$weight)
+quantile(E(g)$weight, c(0.5, 0.75, 0.9, 0.95, 0.99))
+```
+
+```{r plot-main, fig.width=12, fig.height=10, dpi=300}
+library(ggraph); library(graphlayouts)
+
+thresh <- quantile(E(g)$weight, 0.90)
+g_sub  <- delete_edges(g, E(g)[weight < thresh])
+g_sub  <- delete_vertices(g_sub, V(g_sub)[degree(g_sub) == 0])
+vcount(g_sub); ecount(g_sub)
+
+set.seed(42)
+ggraph(g_sub, layout = "stress") +
+  geom_edge_fan(aes(width = weight, alpha = weight),
+                arrow   = arrow(length = unit(1.8, "mm"), type = "closed"),
+                end_cap = circle(2.5, "mm"),
+                colour  = "grey35") +
+  geom_node_point(aes(size = in_deg, fill = in_deg),
+                  shape = 21, colour = "white", stroke = 0.3) +
+  geom_node_text(aes(label = country,
+                     filter = in_deg >= quantile(in_deg, 0.75)),
+                 repel = TRUE, size = 3, max.overlaps = 20) +
+  scale_edge_width(range = c(0.15, 1.8), guide = "none") +
+  scale_edge_alpha(range = c(0.08, 0.5), guide = "none") +
+  scale_size(range = c(1.5, 14), name = "In-degree") +
+  scale_fill_viridis_c(option = "mako", direction = -1, guide = "none") +
+  labs(title = "Global live animal trade network, 2005-2021",
+       subtitle = paste0("Importer-reported flows; edges above ", round(thresh),
+                         " species-year records. 2010 unavailable.")) +
+  theme_graph(base_family = "sans")
+
+ggsave("network_indegree.png", width = 12, height = 10, dpi = 300, bg = "white")
+```
+
+```{r interactive}
+library(visNetwork)
+
+vis_nodes <- data.frame(
+  id    = V(g)$name,
+  label = V(g)$country,
+  value = V(g)$in_deg,
+  title = paste0("<b>", V(g)$country, "</b><br>In-degree: ", V(g)$in_deg,
+                 "<br>Head received: ", format(round(V(g)$in_head), big.mark = ","))
+)
+vis_edges <- as.data.frame(igraph::as_data_frame(g, what = "edges"))
+names(vis_edges)[1:3] <- c("from", "to", "value")
+
+visNetwork(vis_nodes, vis_edges[vis_edges$value >= thresh, ]) |>
+  visEdges(arrows = "to", smooth = FALSE) |>
+  visOptions(highlightNearest = list(enabled = TRUE, degree = 1),
+             nodesIdSelection = TRUE) |>
+  visPhysics(stabilization = FALSE)
+```
+
+```{r weight-ceiling}
+n_sp <- uniqueN(qty$item); n_yr <- uniqueN(qty$year)
+cat("species:", n_sp, " years:", n_yr, " ceiling:", n_sp * n_yr, "\n")
+
+qty[, .N, by = .(reporter_m49, partner_m49, item, year)][N > 1][order(-N)]
+```
+
+```{r species}
+qty[, .(n_flows = .N, head = sum(value_head)), by = item][order(-n_flows)]
+```
+
+```{r weight-decomposition}
+edge_tbl <- as.data.table(igraph::as_data_frame(g, what = "edges"))
+edge_tbl[, .(cor_species = cor(weight, n_species, method = "spearman"),
+             cor_years   = cor(weight, n_years,   method = "spearman"))]
+setorder(edge_tbl, -weight)
+head(edge_tbl[, .(from, to, weight, n_species, n_years)], 15)
+```
+
+
+
+
+```{r geo-join}
+library(sf); library(rnaturalearth); library(ggplot2)
+sf_use_s2(TRUE)
+
+world <- ne_countries(scale = "medium", returnclass = "sf")
+
+pts <- suppressWarnings(st_point_on_surface(st_geometry(world)))
+coords <- as.data.table(st_coordinates(pts))
+setnames(coords, c("lon", "lat"))
+coords[, m49 := sprintf("%03d", as.integer(world$iso_n3))]
+coords <- coords[!is.na(m49) & m49 != "NA"]
+coords <- unique(coords, by = "m49")
+
+node_geo <- merge(node_tbl, coords, by = "m49", all.x = TRUE)
+node_geo[is.na(lon), .(m49, country, in_deg)][order(-in_deg)]
+```
+
+```{r manual-coords}
+manual <- data.table(
+  m49 = c("156", "158"),                    # extend based on the list above
+  lon = c(104.2, 121.0),
+  lat = c(35.9, 23.7)
+)
+node_geo[manual, on = "m49", `:=`(lon = i.lon, lat = i.lat)]
+node_geo <- node_geo[!is.na(lon)]
+```
+
+```{r edge-lines}
+edge_geo <- merge(edge_tbl, node_geo[, .(from = m49, x1 = lon, y1 = lat)], by = "from")
+edge_geo <- merge(edge_geo, node_geo[, .(to   = m49, x2 = lon, y2 = lat)], by = "to")
+edge_geo <- edge_geo[weight >= quantile(edge_tbl$weight, 0.90)]
+
+lines <- st_sfc(lapply(seq_len(nrow(edge_geo)), function(i) {
+  st_linestring(rbind(c(edge_geo$x1[i], edge_geo$y1[i]),
+                      c(edge_geo$x2[i], edge_geo$y2[i])))
+}), crs = 4326)
+
+lines <- st_segmentize(lines, units::set_units(100, km))
+lines <- st_wrap_dateline(st_sf(edge_geo, geometry = lines))
+```
+
+
+```{r map, fig.width=14, fig.height=8, dpi=300}
+crs_rob <- "+proj=robin"
+
+world_rob <- st_transform(world, crs_rob)
+lines_rob <- st_transform(lines[order(lines$weight), ], crs_rob)
+nodes_sf  <- st_transform(
+  st_as_sf(node_geo, coords = c("lon", "lat"), crs = 4326), crs_rob)
+
+ggplot() +
+  geom_sf(data = world_rob, fill = "grey92", colour = "white", linewidth = 0.15) +
+  geom_sf(data = lines_rob, aes(linewidth = weight, alpha = weight),
+          colour = "#B23A48", lineend = "round") +
+  geom_sf(data = nodes_sf, aes(size = in_deg),
+          shape = 21, fill = "#1F4E79", colour = "white", stroke = 0.3, alpha = 0.9) +
+  scale_linewidth(range = c(0.1, 1.4), guide = "none") +
+  scale_alpha(range = c(0.05, 0.45), guide = "none") +
+  scale_size(range = c(0.5, 11), name = "In-degree") +
+  coord_sf(crs = crs_rob, datum = NA, expand = FALSE) +
+  labs(title = "Global live animal trade network, 2005-2021",
+       subtitle = "Importer-reported flows; top 10% of country pairs. 2010 unavailable.") +
+  theme_void() +
+  theme(legend.position = "bottom",
+        plot.background = element_rect(fill = "white", colour = NA))
+
+ggsave("network_map.png", width = 14, height = 8, dpi = 300, bg = "white")
+```
