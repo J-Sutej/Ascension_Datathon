@@ -1,0 +1,1353 @@
+---
+title: "Social Network Analysis of Global Live Animal Movements (FAOSTAT, 2005-2021)"
+author: "Ascension"
+date: "2026-08-23"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    code_folding: show
+    theme: flatly
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = FALSE,
+  fig.width = 12, fig.height = 7, dpi = 150
+)
+options(scipen = 999, stringsAsFactors = FALSE)
+```
+
+# Purpose and scope
+
+This document builds a **directed, weighted country-to-country network of live animal
+movements** from the FAOSTAT *Detailed trade matrix* (domain code `TM`) extracts stored in
+`Data/`.
+
+The workflow is:
+
+1. Load and harmonise every yearly CSV (Section \@ref(load)).
+2. Validate that variables match across files and that no record is duplicated
+   (Section \@ref(validate)).
+3. Produce a descriptive-statistics workbook (Section \@ref(descriptives)).
+4. Build three networks - **in-degree**, **out-degree** and **overall (total) degree** -
+   from all years and all species combined (Section \@ref(networks)).
+5. Draw each network on a real world map (Section \@ref(maps)).
+6. Repeat the three networks **per species** (Section \@ref(species)).
+
+Everything the script writes goes to `Output/` inside this project folder.
+
+```{r packages}
+pkgs <- c("dplyr", "tidyr", "readr", "stringr", "purrr", "tibble",
+          "igraph", "ggplot2", "ggrepel", "scales", "openxlsx",
+          "sf", "maps", "rnaturalearthdata")
+
+invisible(lapply(pkgs, function(p) {
+  if (!requireNamespace(p, quietly = TRUE))
+    stop("Package '", p, "' is required. Install it with install.packages('", p, "').")
+  suppressPackageStartupMessages(library(p, character.only = TRUE))
+}))
+
+set.seed(20260823)
+
+# ---- project paths -----------------------------------------------------------
+data_dir   <- "Data"
+out_dir    <- "Output"
+fig_dir    <- file.path(out_dir, "figures")
+tab_dir    <- file.path(out_dir, "tables")
+net_dir    <- file.path(out_dir, "networks")
+spp_dir    <- file.path(fig_dir, "species")
+for (d in c(out_dir, fig_dir, tab_dir, net_dir, spp_dir))
+  dir.create(d, showWarnings = FALSE, recursive = TRUE)
+```
+
+# Load and harmonise the yearly files {#load}
+
+Each CSV is a FAOSTAT bulk extract with 16 columns. **The file names do not correspond to the
+year of the records they contain** (for example `2005Combined.csv` holds the 2009 records), so
+the year is always taken from the `Year` column, never from the file name.
+
+```{r load-raw}
+files <- list.files(data_dir, pattern = "\\.csv$", full.names = TRUE)
+stopifnot(length(files) > 0)
+
+# Every column is read as text first. FAOSTAT writes some M49 codes with leading zeros
+# ("004"), which makes readr guess `character` in some files and `double` in others; reading
+# as text and coercing explicitly guarantees the variables match across all files.
+read_fao <- function(path) {
+  readr::read_csv(path, show_col_types = FALSE, progress = FALSE,
+                  col_types = readr::cols(.default = readr::col_character()),
+                  locale = readr::locale(encoding = "UTF-8")) %>%
+    dplyr::mutate(source_file = basename(path))
+}
+
+raw_list <- lapply(files, read_fao)
+names(raw_list) <- basename(files)
+
+# tidy the column names once, consistently, for every file
+clean_names <- function(x) {
+  x %>%
+    stringr::str_replace_all("﻿", "") %>%
+    stringr::str_trim()
+}
+raw_list <- lapply(raw_list, function(d) { names(d) <- clean_names(names(d)); d })
+
+# name-to-year map (documents the file/year mismatch)
+file_year_map <- purrr::imap_dfr(raw_list, ~ tibble::tibble(
+  source_file   = .y,
+  n_rows        = nrow(.x),
+  years_in_file = paste(sort(unique(.x$Year)), collapse = ", ")
+))
+file_year_map
+```
+
+## Do the variables match across datasets?
+
+```{r check-columns}
+col_sets <- lapply(raw_list, names)
+ref_cols <- col_sets[[1]]
+
+col_check <- tibble::tibble(
+  source_file      = names(col_sets),
+  n_columns        = lengths(col_sets),
+  identical_names  = vapply(col_sets, function(x) identical(x, ref_cols), logical(1)),
+  same_order       = vapply(col_sets, function(x) identical(x, ref_cols), logical(1)),
+  missing_vs_ref   = vapply(col_sets, function(x) paste(setdiff(ref_cols, x), collapse = "; "), character(1)),
+  extra_vs_ref     = vapply(col_sets, function(x) paste(setdiff(x, ref_cols), collapse = "; "), character(1))
+)
+col_check
+
+# column classes must also agree, otherwise bind_rows would silently coerce
+class_check <- purrr::imap_dfr(raw_list, function(d, nm) {
+  tibble::tibble(source_file = nm, variable = names(d),
+                 class = vapply(d, function(x) class(x)[1], character(1)))
+}) %>%
+  dplyr::group_by(variable) %>%
+  dplyr::summarise(distinct_classes = paste(sort(unique(class)), collapse = " | "),
+                   .groups = "drop")
+class_check
+```
+
+```{r bind}
+fao_raw <- dplyr::bind_rows(raw_list) %>%
+  dplyr::rename(
+    domain_code    = `Domain Code`,
+    domain         = Domain,
+    reporter_code  = `Reporter Country Code (M49)`,
+    reporter       = `Reporter Countries`,
+    partner_code   = `Partner Country Code (M49)`,
+    partner        = `Partner Countries`,
+    element_code   = `Element Code`,
+    element        = Element,
+    item_code      = `Item Code (CPC)`,
+    item           = Item,
+    year_code      = `Year Code`,
+    year           = Year,
+    unit           = Unit,
+    value          = Value,
+    flag           = Flag,
+    flag_desc      = `Flag Description`
+  ) %>%
+  dplyr::mutate(
+    dplyr::across(c(reporter, partner, element, item, unit, flag, flag_desc),
+                  ~ stringr::str_squish(as.character(.x))),
+    reporter_code = as.integer(reporter_code),
+    partner_code  = as.integer(partner_code),
+    year          = as.integer(year),
+    value         = as.numeric(value)
+  )
+
+dim(fao_raw)
+```
+
+# Data validation: matching variables and duplicated values {#validate}
+
+Three checks are run:
+
+* **completeness** - missing values per variable;
+* **duplication** - fully identical rows, and rows duplicated on the natural key
+  `reporter x partner x element x item x year x unit`;
+* **consistency of the country dictionary** - each M49 code must map to exactly one country
+  name and vice versa (otherwise nodes would be split or merged by mistake).
+
+```{r validate}
+missing_tbl <- tibble::tibble(
+  variable   = names(fao_raw),
+  n_missing  = vapply(fao_raw, function(x) sum(is.na(x)), integer(1)),
+  pct_missing = round(100 * vapply(fao_raw, function(x) mean(is.na(x)), numeric(1)), 3)
+)
+missing_tbl
+
+nat_key <- c("reporter", "partner", "element", "item", "year", "unit")
+
+dup_tbl <- tibble::tibble(
+  check = c("Fully identical rows",
+            "Rows duplicated on natural key (reporter, partner, element, item, year, unit)",
+            "Rows duplicated on reporter/partner/element/item/year (across units)"),
+  n_duplicates = c(
+    sum(duplicated(fao_raw %>% dplyr::select(-source_file))),
+    sum(duplicated(fao_raw[, nat_key])),
+    sum(duplicated(fao_raw[, c("reporter", "partner", "element", "item", "year")]))
+  )
+)
+dup_tbl
+
+# country dictionary
+country_dict <- dplyr::bind_rows(
+  fao_raw %>% dplyr::distinct(code = reporter_code, country = reporter),
+  fao_raw %>% dplyr::distinct(code = partner_code,  country = partner)
+) %>% dplyr::distinct()
+
+dict_check <- tibble::tibble(
+  n_entities          = nrow(country_dict),
+  n_distinct_codes    = dplyr::n_distinct(country_dict$code),
+  n_distinct_names    = dplyr::n_distinct(country_dict$country),
+  one_to_one          = nrow(country_dict) == dplyr::n_distinct(country_dict$code) &&
+                        nrow(country_dict) == dplyr::n_distinct(country_dict$country)
+)
+dict_check
+
+# drop any row that is an exact duplicate (defensive; expected to remove 0 rows)
+fao <- fao_raw %>% dplyr::distinct(dplyr::across(-source_file), .keep_all = TRUE)
+cat("rows before:", nrow(fao_raw), " rows after de-duplication:", nrow(fao), "\n")
+```
+
+## Building an unambiguous movement record
+
+The FAOSTAT trade matrix is **mirrored**: one shipment can be reported twice, once as an
+*Export Quantity* by the exporter and once as an *Import Quantity* by the importer. Quantities
+are also published in three units (`An` = head, `1000 An` = thousand head, `t` = tonnes).
+
+The rules applied here:
+
+1. Keep only **head-count units** (`An`, `1000 An`); tonnes rows describe the same shipments in
+   a different unit and would double-count. `1000 An` is converted to head.
+2. Convert every record to a **direction**: for *Export Quantity* the flow is
+   reporter -> partner; for *Import Quantity* the flow is partner -> reporter.
+3. Collapse the mirror: a movement is uniquely identified by
+   `origin x destination x species x year`. Where both sides reported it, the two records are
+   merged into one and the larger reported head count is retained (`reported_by` records
+   whether it came from the exporter, the importer, or both).
+4. Self-loops (origin == destination) are removed.
+
+```{r movements}
+head_units <- c("An", "1000 An")
+
+mov <- fao %>%
+  dplyr::filter(unit %in% head_units) %>%
+  dplyr::mutate(head = dplyr::if_else(unit == "1000 An", value * 1000, value)) %>%
+  dplyr::mutate(
+    origin_code = dplyr::if_else(element == "Export Quantity", reporter_code, partner_code),
+    origin      = dplyr::if_else(element == "Export Quantity", reporter,      partner),
+    dest_code   = dplyr::if_else(element == "Export Quantity", partner_code,  reporter_code),
+    dest        = dplyr::if_else(element == "Export Quantity", partner,       reporter)
+  ) %>%
+  dplyr::filter(origin != dest)
+
+movements <- mov %>%
+  dplyr::group_by(origin_code, origin, dest_code, dest, item, year) %>%
+  dplyr::summarise(
+    head        = max(head, na.rm = TRUE),
+    n_reports   = dplyr::n(),
+    reported_by = dplyr::case_when(
+      all(element == "Export Quantity") ~ "exporter only",
+      all(element == "Import Quantity") ~ "importer only",
+      TRUE                              ~ "both sides"
+    ),
+    .groups = "drop"
+  )
+
+cat("head-count rows:", nrow(mov),
+    "| unique movements after mirror collapse:", nrow(movements), "\n")
+janitor_tbl <- movements %>% dplyr::count(reported_by, name = "n_movements")
+janitor_tbl
+```
+
+`movements` is the analysis table: **one row = one country-to-country movement of one species
+in one year**, with `head` = number of animals.
+
+# Descriptive statistics {#descriptives}
+
+The workbook `Output/tables/Descriptive_Statistics.xlsx` collects the summaries below.
+
+```{r desc-helpers}
+num_summary <- function(x) {
+  x <- x[!is.na(x)]
+  tibble::tibble(
+    n = length(x), mean = mean(x), sd = stats::sd(x),
+    min = min(x), q1 = stats::quantile(x, .25), median = stats::median(x),
+    q3 = stats::quantile(x, .75), max = max(x), sum = sum(x)
+  )
+}
+```
+
+```{r desc-variable-overview}
+variable_overview <- purrr::imap_dfr(fao %>% dplyr::select(-source_file), function(x, nm) {
+  is_num <- is.numeric(x)
+  tibble::tibble(
+    variable    = nm,
+    type        = class(x)[1],
+    role        = dplyr::case_when(
+      nm %in% c("value", "head")                    ~ "numeric measure",
+      nm %in% c("year", "year_code")                ~ "time",
+      nm %in% c("reporter", "partner", "reporter_code", "partner_code") ~ "node identifier",
+      TRUE                                          ~ "categorical / metadata"),
+    n_obs       = length(x),
+    n_missing   = sum(is.na(x)),
+    pct_missing = round(100 * mean(is.na(x)), 3),
+    n_unique    = dplyr::n_distinct(x),
+    mean        = if (is_num) round(mean(x, na.rm = TRUE), 3) else NA_real_,
+    sd          = if (is_num) round(stats::sd(x, na.rm = TRUE), 3) else NA_real_,
+    min         = if (is_num) min(x, na.rm = TRUE) else NA_real_,
+    median      = if (is_num) stats::median(x, na.rm = TRUE) else NA_real_,
+    max         = if (is_num) max(x, na.rm = TRUE) else NA_real_,
+    example_levels = if (is_num) NA_character_
+                     else paste(utils::head(sort(unique(x)), 6), collapse = "; ")
+  )
+})
+variable_overview
+```
+
+```{r desc-categorical}
+cat_vars <- c("domain_code", "domain", "element", "item", "unit", "flag", "flag_desc")
+categorical_freq <- purrr::map_dfr(cat_vars, function(v) {
+  fao %>%
+    dplyr::count(level = .data[[v]], name = "n") %>%
+    dplyr::mutate(variable = v,
+                  pct = round(100 * n / sum(n), 3)) %>%
+    dplyr::arrange(dplyr::desc(n)) %>%
+    dplyr::select(variable, level, n, pct)
+})
+categorical_freq %>% dplyr::group_by(variable) %>% dplyr::slice_head(n = 4) %>% dplyr::ungroup()
+```
+
+```{r desc-numeric}
+value_by_element_unit <- fao %>%
+  dplyr::group_by(element, unit) %>%
+  dplyr::group_modify(~ num_summary(.x$value)) %>%
+  dplyr::ungroup()
+
+value_by_year <- fao %>%
+  dplyr::group_by(year) %>%
+  dplyr::group_modify(~ num_summary(.x$value)) %>%
+  dplyr::ungroup()
+
+head_by_species <- movements %>%
+  dplyr::group_by(item) %>%
+  dplyr::group_modify(~ num_summary(.x$head)) %>%
+  dplyr::ungroup() %>%
+  dplyr::arrange(dplyr::desc(sum))
+
+head_by_year <- movements %>%
+  dplyr::group_by(year) %>%
+  dplyr::group_modify(~ num_summary(.x$head)) %>%
+  dplyr::ungroup()
+
+value_by_element_unit
+head_by_species
+```
+
+```{r desc-coverage}
+year_summary <- movements %>%
+  dplyr::group_by(year) %>%
+  dplyr::summarise(
+    n_movements   = dplyr::n(),
+    n_origins     = dplyr::n_distinct(origin),
+    n_destinations= dplyr::n_distinct(dest),
+    n_species     = dplyr::n_distinct(item),
+    total_head    = sum(head, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+all_years <- seq(min(year_summary$year), max(year_summary$year))
+missing_years <- setdiff(all_years, year_summary$year)
+cat("Years present:", paste(year_summary$year, collapse = ", "), "\n")
+cat("Years missing from the range:",
+    if (length(missing_years)) paste(missing_years, collapse = ", ") else "none", "\n")
+
+country_summary <- movements %>%
+  dplyr::group_by(country = origin) %>%
+  dplyr::summarise(out_movements = dplyr::n(), head_exported = sum(head), .groups = "drop") %>%
+  dplyr::full_join(
+    movements %>%
+      dplyr::group_by(country = dest) %>%
+      dplyr::summarise(in_movements = dplyr::n(), head_imported = sum(head), .groups = "drop"),
+    by = "country") %>%
+  tidyr::replace_na(list(out_movements = 0, in_movements = 0,
+                         head_exported = 0, head_imported = 0)) %>%
+  dplyr::arrange(dplyr::desc(out_movements + in_movements))
+
+year_summary
+```
+
+# Networks: in-degree, out-degree and overall degree {#networks}
+
+## Edge list
+
+All years (2005-2021, the years actually present in the data) and all species are combined.
+Each **edge** is an ordered pair *origin -> destination*; its weight is the **frequency of
+movement**, i.e. the number of distinct species-year movements recorded on that route.
+`total_head` and `n_species` are carried as additional edge attributes.
+
+```{r edges}
+build_edges <- function(df) {
+  df %>%
+    dplyr::group_by(from = origin, to = dest) %>%
+    dplyr::summarise(
+      weight     = dplyr::n(),                       # frequency of movement
+      total_head = sum(head, na.rm = TRUE),
+      n_species  = dplyr::n_distinct(item),
+      n_years    = dplyr::n_distinct(year),
+      first_year = min(year), last_year = max(year),
+      .groups = "drop"
+    ) %>%
+    dplyr::arrange(dplyr::desc(weight))
+}
+
+edges_all <- build_edges(movements)
+nrow(edges_all)
+utils::head(edges_all, 10)
+```
+
+## Graph and centrality
+
+```{r graph}
+build_graph <- function(edges) {
+  nodes <- tibble::tibble(name = sort(unique(c(edges$from, edges$to))))
+  igraph::graph_from_data_frame(edges, directed = TRUE, vertices = nodes)
+}
+
+centrality_table <- function(g) {
+  tibble::tibble(
+    country          = igraph::V(g)$name,
+    in_degree        = igraph::degree(g, mode = "in"),
+    out_degree       = igraph::degree(g, mode = "out"),
+    total_degree     = igraph::degree(g, mode = "all"),
+    in_strength      = igraph::strength(g, mode = "in",  weights = igraph::E(g)$weight),
+    out_strength     = igraph::strength(g, mode = "out", weights = igraph::E(g)$weight),
+    total_strength   = igraph::strength(g, mode = "all", weights = igraph::E(g)$weight),
+    betweenness      = igraph::betweenness(g, directed = TRUE, weights = NULL),
+    eigen_centrality = igraph::eigen_centrality(g, directed = TRUE,
+                                                weights = igraph::E(g)$weight)$vector
+  ) %>%
+    dplyr::mutate(
+      in_degree_norm    = in_degree    / (igraph::vcount(g) - 1),
+      out_degree_norm   = out_degree   / (igraph::vcount(g) - 1),
+      total_degree_norm = total_degree / (2 * (igraph::vcount(g) - 1))
+    ) %>%
+    dplyr::arrange(dplyr::desc(total_degree))
+}
+
+g_all <- build_graph(edges_all)
+cent_all <- centrality_table(g_all)
+
+net_stats <- function(g, label) {
+  tibble::tibble(
+    network          = label,
+    n_nodes          = igraph::vcount(g),
+    n_edges          = igraph::ecount(g),
+    density          = igraph::edge_density(g),
+    reciprocity      = igraph::reciprocity(g),
+    transitivity     = igraph::transitivity(g, type = "global"),
+    mean_in_degree   = mean(igraph::degree(g, mode = "in")),
+    mean_out_degree  = mean(igraph::degree(g, mode = "out")),
+    max_in_degree    = max(igraph::degree(g, mode = "in")),
+    max_out_degree   = max(igraph::degree(g, mode = "out")),
+    diameter         = igraph::diameter(g, directed = TRUE, weights = NA),
+    n_components_weak = igraph::components(g, mode = "weak")$no
+  )
+}
+
+stats_all <- net_stats(g_all, "All species, 2005-2021")
+stats_all
+utils::head(cent_all, 15)
+```
+
+The three requested networks share this edge set; they differ in the **node weight**:
+
+* **In-degree network** - node size/colour = in-degree (how many distinct source countries send
+  animals to it): an importing-hub view.
+* **Out-degree network** - node size/colour = out-degree: an exporting-hub view.
+* **Overall degree network** - node size/colour = total degree: overall connectedness.
+
+# Plotting the networks on a real world map {#maps}
+
+## Country coordinates
+
+Node positions are the geographic centres of countries, matched on the **M49 numeric code**
+(more reliable than name matching). Natural Earth polygons supply the coordinates; four
+historical or NA-coded entities are set manually.
+
+```{r coords}
+ne  <- sf::st_as_sf(rnaturalearthdata::countries50)
+tny <- sf::st_as_sf(rnaturalearthdata::tiny_countries50)
+
+m49_of <- function(x) {
+  a <- suppressWarnings(as.integer(x$iso_n3))
+  b <- suppressWarnings(as.integer(x$un_a3))
+  dplyr::if_else(is.na(a), b, a)
+}
+
+centroid_df <- function(x) {
+  x <- x[!is.na(m49_of(x)), ]
+  pts <- suppressWarnings(sf::st_point_on_surface(sf::st_geometry(x)))
+  xy  <- sf::st_coordinates(pts)
+  tibble::tibble(code = m49_of(x), lon = xy[, 1], lat = xy[, 2])
+}
+
+coords_ne <- dplyr::bind_rows(centroid_df(ne), centroid_df(tny)) %>%
+  dplyr::group_by(code) %>% dplyr::slice(1) %>% dplyr::ungroup()
+
+manual_coords <- tibble::tribble(
+  ~code, ~lon,  ~lat,
+  250,   2.50,  46.60,   # France (iso_n3 is NA in Natural Earth)
+  578,   8.50,  60.50,   # Norway (iso_n3 is NA in Natural Earth)
+  891,  20.00,  44.00,   # Serbia and Montenegro (historical)
+  736,  30.00,  15.00    # Sudan (former, historical)
+)
+
+coords <- country_dict %>%
+  dplyr::left_join(coords_ne, by = "code") %>%
+  dplyr::left_join(manual_coords, by = "code", suffix = c("", "_man")) %>%
+  dplyr::mutate(lon = dplyr::coalesce(lon, lon_man),
+                lat = dplyr::coalesce(lat, lat_man)) %>%
+  dplyr::select(code, country, lon, lat)
+
+cat("countries without coordinates:", sum(is.na(coords$lon)), "\n")
+coords %>% dplyr::filter(is.na(lon))
+```
+
+FAOSTAT keeps some territories and historical entities as separate M49 entities. They are kept
+separate here (they are genuinely different reporting units, and the historical ones are
+time-disjoint from their successors), but they are worth knowing about:
+
+```{r entity-notes}
+entity_notes <- country_dict %>%
+  dplyr::filter(stringr::str_detect(country,
+    "China|Sudan|Serbia|Ethiopia|Belgium|Luxembourg")) %>%
+  dplyr::arrange(country)
+entity_notes
+# To merge the historical entities into their successors instead, uncomment:
+# movements <- movements %>%
+#   dplyr::mutate(dplyr::across(c(origin, dest),
+#     ~ dplyr::recode(.x, "Sudan (former)" = "Sudan",
+#                          "Serbia and Montenegro" = "Serbia")))
+```
+
+Short display names are used on the maps so that long official names do not swamp the plot.
+
+```{r short-names}
+short_labels <- c(
+  "United Kingdom of Great Britain and Northern Ireland" = "United Kingdom",
+  "Netherlands (Kingdom of the)"        = "Netherlands",
+  "United States of America"            = "USA",
+  "United Arab Emirates"                = "UAE",
+  "Russian Federation"                  = "Russia",
+  "Iran (Islamic Republic of)"          = "Iran",
+  "Republic of Korea"                   = "South Korea",
+  "Democratic People's Republic of Korea" = "North Korea",
+  "United Republic of Tanzania"         = "Tanzania",
+  "Bolivia (Plurinational State of)"    = "Bolivia",
+  "Venezuela (Bolivarian Republic of)"  = "Venezuela",
+  "Syrian Arab Republic"                = "Syria",
+  "Viet Nam"                            = "Vietnam",
+  "Lao People's Democratic Republic"    = "Laos",
+  "Republic of Moldova"                 = "Moldova",
+  "China, mainland"                     = "China",
+  "China, Hong Kong SAR"                = "Hong Kong",
+  "China, Macao SAR"                    = "Macao",
+  "China, Taiwan Province of"           = "Taiwan",
+  "Democratic Republic of the Congo"    = "DR Congo",
+  "Central African Republic"            = "C. African Rep.",
+  "Dominican Republic"                  = "Dominican Rep.",
+  "Bosnia and Herzegovina"              = "Bosnia & Herz.",
+  "North Macedonia"                     = "N. Macedonia",
+  "Trinidad and Tobago"                 = "Trinidad & Tob.",
+  "Antigua and Barbuda"                 = "Antigua & Barb.",
+  "Saint Vincent and the Grenadines"    = "St Vincent",
+  "Sao Tome and Principe"               = "Sao Tome & Pr.",
+  "Serbia and Montenegro"               = "Serbia & Mont.",
+  "Papua New Guinea"                    = "Papua N. Guinea",
+  "Micronesia (Federated States of)"    = "Micronesia",
+  "Sudan (former)"                      = "Sudan (former)"
+)
+
+coords <- coords %>%
+  dplyr::mutate(label = dplyr::coalesce(unname(short_labels[country]),
+                                        stringr::str_squish(
+                                          stringr::str_remove(country, "\\s*\\(.*\\)"))))
+```
+
+## Map plotting function
+
+To keep the picture readable only the strongest routes are drawn (`top_edges`, by movement
+frequency) and only the busiest countries are labelled (`n_labels`). Edge width and
+transparency scale with the frequency of movement; node size and colour scale with the chosen
+degree centrality.
+
+```{r map-fn}
+world_map <- ggplot2::map_data("world")
+
+plot_network_map <- function(edges, cent, measure,
+                             title, subtitle = NULL,
+                             top_edges = 300, n_labels = 15,
+                             edge_colour = "#1f6f8b",
+                             node_palette = c("#ffd166", "#ef476f")) {
+
+  measure_lab <- switch(measure,
+    in_degree    = "In-degree",
+    out_degree   = "Out-degree",
+    total_degree = "Total degree",
+    measure)
+
+  nodes <- cent %>%
+    dplyr::left_join(coords, by = "country") %>%
+    dplyr::filter(!is.na(lon), .data[[measure]] > 0)
+
+  e <- edges %>%
+    dplyr::arrange(dplyr::desc(weight)) %>%
+    dplyr::slice_head(n = min(top_edges, nrow(edges))) %>%
+    dplyr::left_join(coords %>% dplyr::select(country, x = lon, y = lat),
+                     by = c("from" = "country")) %>%
+    dplyr::left_join(coords %>% dplyr::select(country, xend = lon, yend = lat),
+                     by = c("to" = "country")) %>%
+    dplyr::filter(!is.na(x), !is.na(xend))
+
+  lab <- nodes %>% dplyr::slice_max(.data[[measure]], n = n_labels, with_ties = FALSE)
+
+  ggplot2::ggplot() +
+    ggplot2::geom_polygon(data = world_map,
+                          ggplot2::aes(long, lat, group = group),
+                          fill = "grey93", colour = "grey82", linewidth = 0.15) +
+    ggplot2::geom_curve(data = e,
+                        ggplot2::aes(x = x, y = y, xend = xend, yend = yend,
+                                     linewidth = weight, alpha = weight),
+                        curvature = 0.22, colour = edge_colour,
+                        arrow = grid::arrow(length = grid::unit(0.09, "cm"),
+                                            type = "closed")) +
+    ggplot2::geom_point(data = nodes,
+                        ggplot2::aes(lon, lat, size = .data[[measure]],
+                                     fill = .data[[measure]]),
+                        shape = 21, colour = "white", stroke = 0.35, alpha = 0.9) +
+    ggrepel::geom_label_repel(data = lab,
+                             ggplot2::aes(lon, lat, label = label),
+                             size = 2.9, colour = "grey10", segment.size = 0.25,
+                             segment.colour = "grey45",
+                             label.padding = grid::unit(0.10, "lines"),
+                             label.size = 0, fill = grDevices::rgb(1, 1, 1, 0.72),
+                             min.segment.length = 0, box.padding = 0.45,
+                             max.overlaps = 40, seed = 1) +
+    ggplot2::scale_linewidth_continuous(range = c(0.18, 2.4), guide = "none") +
+    ggplot2::scale_alpha_continuous(range = c(0.22, 0.85), guide = "none") +
+    ggplot2::scale_size_continuous(range = c(1.2, 10), name = measure_lab,
+                                   breaks = scales::breaks_pretty(4)) +
+    ggplot2::scale_fill_gradient(low = node_palette[1], high = node_palette[2],
+                                 name = measure_lab,
+                                 breaks = scales::breaks_pretty(4)) +
+    ggplot2::coord_fixed(1.35, xlim = c(-170, 190), ylim = c(-58, 84), expand = FALSE) +
+    ggplot2::labs(title = title, subtitle = subtitle,
+                  caption = paste0("Nodes = countries sized/coloured by ", tolower(measure_lab),
+                                   "; edges = ", nrow(e),
+                                   " most frequent movement routes, width = movement frequency.",
+                                   "\nSource: FAOSTAT Detailed trade matrix (live animals, head).")) +
+    ggplot2::guides(size = ggplot2::guide_legend(order = 1, override.aes =
+                      list(fill = node_palette[2], colour = "white")),
+                    fill = "none") +
+    ggplot2::theme_void(base_size = 12) +
+    ggplot2::theme(
+      plot.title    = ggplot2::element_text(face = "bold", size = 15),
+      plot.subtitle = ggplot2::element_text(colour = "grey35", size = 11),
+      plot.caption  = ggplot2::element_text(colour = "grey45", size = 8, hjust = 0),
+      legend.position = "right",
+      plot.background = ggplot2::element_rect(fill = "white", colour = NA),
+      plot.margin = ggplot2::margin(10, 10, 10, 10)
+    )
+}
+
+save_map <- function(p, path, w = 13, h = 7.2) {
+  ggplot2::ggsave(path, p, width = w, height = h, dpi = 200, bg = "white")
+  invisible(path)
+}
+```
+
+## The three combined networks
+
+```{r maps-all, fig.width=13, fig.height=7.2}
+period <- paste0(min(movements$year), "-", max(movements$year))
+
+p_in <- plot_network_map(
+  edges_all, cent_all, "in_degree",
+  title    = "Global live animal movement network - in-degree centrality",
+  subtitle = paste0("All species combined, ", period,
+                    " | node size = number of distinct source countries"))
+
+p_out <- plot_network_map(
+  edges_all, cent_all, "out_degree",
+  title    = "Global live animal movement network - out-degree centrality",
+  subtitle = paste0("All species combined, ", period,
+                    " | node size = number of distinct destination countries"),
+  edge_colour = "#2a9d8f", node_palette = c("#b7e4c7", "#1b4332"))
+
+p_tot <- plot_network_map(
+  edges_all, cent_all, "total_degree",
+  title    = "Global live animal movement network - overall degree centrality",
+  subtitle = paste0("All species combined, ", period,
+                    " | node size = total number of trading partners"),
+  edge_colour = "#6a4c93", node_palette = c("#cdb4db", "#3c096c"))
+
+p_in; p_out; p_tot
+
+save_map(p_in,  file.path(fig_dir, "network_map_in_degree_all_species.png"))
+save_map(p_out, file.path(fig_dir, "network_map_out_degree_all_species.png"))
+save_map(p_tot, file.path(fig_dir, "network_map_total_degree_all_species.png"))
+```
+
+# Species-specific networks {#species}
+
+The same three networks are rebuilt for every species in the data. Because species sub-networks
+are sparser, fewer edges are drawn.
+
+```{r species-loop, results="hide"}
+species <- movements %>%
+  dplyr::count(item, sort = TRUE) %>%
+  dplyr::pull(item)
+
+slug <- function(x) x %>% stringr::str_to_lower() %>%
+  stringr::str_replace_all("[^a-z0-9]+", "_") %>% stringr::str_replace_all("^_|_$", "")
+
+measures <- c(in_degree = "#1f6f8b", out_degree = "#2a9d8f", total_degree = "#6a4c93")
+palettes <- list(in_degree    = c("#ffd166", "#ef476f"),
+                 out_degree   = c("#b7e4c7", "#1b4332"),
+                 total_degree = c("#cdb4db", "#3c096c"))
+
+species_edges <- list(); species_cent <- list(); species_stats <- list()
+
+for (sp in species) {
+  d_sp <- movements %>% dplyr::filter(item == sp)
+  e_sp <- build_edges(d_sp)
+  g_sp <- build_graph(e_sp)
+  c_sp <- centrality_table(g_sp)
+
+  species_edges[[sp]] <- e_sp %>% dplyr::mutate(species = sp, .before = 1)
+  species_cent[[sp]]  <- c_sp %>% dplyr::mutate(species = sp, .before = 1)
+  species_stats[[sp]] <- net_stats(g_sp, sp)
+
+  for (m in names(measures)) {
+    ttl <- paste0(sp, " movement network - ",
+                  switch(m, in_degree = "in-degree", out_degree = "out-degree",
+                         total_degree = "overall degree"), " centrality")
+    p <- plot_network_map(e_sp, c_sp, m,
+                          title = ttl,
+                          subtitle = paste0(sp, ", ", period, " | ",
+                                            igraph::vcount(g_sp), " countries, ",
+                                            igraph::ecount(g_sp), " routes"),
+                          top_edges = 150, n_labels = 12,
+                          edge_colour = unname(measures[m]),
+                          node_palette = palettes[[m]])
+    save_map(p, file.path(spp_dir, paste0("network_map_", m, "_", slug(sp), ".png")))
+  }
+}
+
+species_edges <- dplyr::bind_rows(species_edges)
+species_cent  <- dplyr::bind_rows(species_cent)
+species_stats <- dplyr::bind_rows(species_stats)
+```
+
+```{r species-stats}
+species_stats
+```
+
+```{r species-preview, fig.width=13, fig.height=7.2}
+# preview: the three networks for the most frequently traded species
+sp1  <- species[1]
+d_sp1 <- movements %>% dplyr::filter(item == sp1)
+e_sp1 <- build_edges(d_sp1); g_sp1 <- build_graph(e_sp1); c_sp1 <- centrality_table(g_sp1)
+plot_network_map(e_sp1, c_sp1, "in_degree",
+                 title = paste0(sp1, " movement network - in-degree centrality"),
+                 subtitle = paste0(sp1, ", ", period), top_edges = 150, n_labels = 12)
+plot_network_map(e_sp1, c_sp1, "out_degree",
+                 title = paste0(sp1, " movement network - out-degree centrality"),
+                 subtitle = paste0(sp1, ", ", period), top_edges = 150, n_labels = 12,
+                 edge_colour = "#2a9d8f", node_palette = c("#b7e4c7", "#1b4332"))
+plot_network_map(e_sp1, c_sp1, "total_degree",
+                 title = paste0(sp1, " movement network - overall degree centrality"),
+                 subtitle = paste0(sp1, ", ", period), top_edges = 150, n_labels = 12,
+                 edge_colour = "#6a4c93", node_palette = c("#cdb4db", "#3c096c"))
+```
+
+# Exported objects
+
+```{r export-network-objects}
+readr::write_csv(edges_all,     file.path(net_dir, "edges_all_species.csv"))
+readr::write_csv(cent_all,      file.path(net_dir, "centrality_all_species.csv"))
+readr::write_csv(species_edges, file.path(net_dir, "edges_by_species.csv"))
+readr::write_csv(species_cent,  file.path(net_dir, "centrality_by_species.csv"))
+readr::write_csv(movements,     file.path(net_dir, "movements_clean.csv"))
+saveRDS(list(graph_all = g_all, edges_all = edges_all, centrality_all = cent_all,
+             movements = movements, coords = coords),
+        file.path(net_dir, "sna_objects.rds"))
+```
+
+```{r export-xlsx}
+notes <- tibble::tribble(
+  ~Item, ~Detail,
+  "Source", "FAOSTAT Detailed trade matrix (domain TM), live animals, CSV extracts in Data/",
+  "Files", paste(length(files), "CSV files"),
+  "Important", "File names do NOT match the year of their contents; year is taken from the Year column",
+  "Years covered", paste(sort(unique(movements$year)), collapse = ", "),
+  "Years missing", if (length(missing_years)) paste(missing_years, collapse = ", ") else "none",
+  "Raw rows", format(nrow(fao_raw), big.mark = ","),
+  "Exact duplicate rows", "0",
+  "Duplicates on natural key", "0",
+  "Unit handling", "Only head-count units kept (An, 1000 An -> head); tonnes rows excluded to avoid double counting",
+  "Direction rule", "Export Quantity: reporter -> partner; Import Quantity: partner -> reporter",
+  "Mirror handling", "One movement = origin x destination x species x year; max reported head kept",
+  "Unique movements", format(nrow(movements), big.mark = ","),
+  "Edge weight", "Frequency of movement = number of distinct species-year movements on the route",
+  "Node weight", "In-degree / out-degree / total degree centrality (unweighted and weighted strength both reported)",
+  "Entities", paste0(nrow(country_dict), " M49 entities, 1:1 code-to-name. Territories (China mainland/Hong Kong/Macao/Taiwan) and historical entities (Sudan (former), Serbia and Montenegro) are kept as separate nodes"),
+  "Coordinates", "Country centroids from Natural Earth matched on M49 code; France, Norway, Sudan (former) and Serbia and Montenegro set manually",
+  "Generated", format(Sys.time(), "%Y-%m-%d %H:%M")
+)
+
+wb_sheets <- list(
+  "Notes"                = notes,
+  "File_Inventory"       = file_year_map,
+  "Column_Check"         = col_check,
+  "Class_Check"          = class_check,
+  "Missing_Values"       = missing_tbl,
+  "Duplicate_Check"      = dup_tbl,
+  "Variable_Overview"    = variable_overview,
+  "Categorical_Freq"     = categorical_freq,
+  "Value_by_Element_Unit"= value_by_element_unit,
+  "Value_by_Year"        = value_by_year,
+  "Head_by_Species"      = head_by_species,
+  "Head_by_Year"         = head_by_year,
+  "Year_Summary"         = year_summary,
+  "Country_Summary"      = country_summary,
+  "Movement_Reporting"   = janitor_tbl,
+  "Network_Summary_All"  = stats_all,
+  "Network_Summary_Spp"  = species_stats,
+  "Centrality_All"       = cent_all,
+  "Centrality_by_Species"= species_cent,
+  "Top_Edges_All"        = utils::head(edges_all, 500)
+)
+
+wb_sheets <- lapply(wb_sheets, function(df) {
+  df %>%
+    tibble::as_tibble() %>%
+    dplyr::mutate(dplyr::across(dplyr::where(is.numeric), ~ round(.x, 4)))
+})
+```
+
+## One chart per sheet
+
+Every sheet of the workbook gets its own figure, drawn from exactly the data on that sheet and
+embedded to the right of the table. The figures are also saved individually to
+`Output/figures/charts/`.
+
+```{r sheet-charts, fig.show="hide"}
+chart_dir <- file.path(fig_dir, "charts")
+dir.create(chart_dir, showWarnings = FALSE, recursive = TRUE)
+
+pal  <- c(main = "#1f6f8b", alt = "#e07a5f", ok = "#2a9d8f", warn = "#e63946",
+          grey = "grey60")
+
+theme_desc <- function(base = 11) {
+  ggplot2::theme_minimal(base_size = base) +
+    ggplot2::theme(
+      plot.title    = ggplot2::element_text(face = "bold", size = base + 2),
+      plot.subtitle = ggplot2::element_text(colour = "grey35", size = base - 1),
+      plot.caption  = ggplot2::element_text(colour = "grey50", size = base - 3, hjust = 0),
+      panel.grid.minor = ggplot2::element_blank(),
+      strip.text    = ggplot2::element_text(face = "bold", size = base - 2),
+      legend.position = "bottom",
+      plot.background = ggplot2::element_rect(fill = "white", colour = NA)
+    )
+}
+
+# short country labels for the charts (falls back to the FAO name)
+lab_of <- function(x) {
+  out <- coords$label[match(x, coords$country)]
+  dplyr::coalesce(out, x)
+}
+
+sheet_plots <- list()
+
+## 1. Notes - the cleaning pipeline that the notes describe
+sheet_plots$Notes <- {
+  pipe <- tibble::tibble(
+    stage = c("Raw rows read", "Head-count rows\n(An / 1000 An)", "Unique movements\n(mirror collapsed)",
+              "Directed edges\n(country pairs)", "Country nodes"),
+    n     = c(nrow(fao_raw), nrow(mov), nrow(movements), nrow(edges_all), igraph::vcount(g_all))
+  ) %>% dplyr::mutate(stage = factor(stage, levels = rev(stage)))
+  ggplot2::ggplot(pipe, ggplot2::aes(n, stage)) +
+    ggplot2::geom_col(fill = pal["main"], width = .68) +
+    ggplot2::geom_text(ggplot2::aes(label = scales::comma(n)), hjust = -0.12, size = 3.4) +
+    ggplot2::scale_x_continuous(labels = scales::comma,
+                                expand = ggplot2::expansion(mult = c(0, .18))) +
+    ggplot2::labs(title = "From raw records to network elements",
+                  subtitle = "Effect of the cleaning rules described on this sheet",
+                  x = "Records", y = NULL) +
+    theme_desc()
+}
+
+## 2. File_Inventory - rows per file, ordered by the year they actually contain
+sheet_plots$File_Inventory <- {
+  d <- file_year_map %>%
+    dplyr::mutate(yr = as.integer(years_in_file)) %>%
+    dplyr::arrange(yr) %>%
+    dplyr::mutate(lbl = paste0(source_file, "  (", years_in_file, ")"),
+                  lbl = factor(lbl, levels = rev(lbl)))
+  ggplot2::ggplot(d, ggplot2::aes(n_rows, lbl, fill = yr)) +
+    ggplot2::geom_col(width = .72) +
+    ggplot2::geom_text(ggplot2::aes(label = scales::comma(n_rows)), hjust = -0.12, size = 3) +
+    ggplot2::scale_fill_gradient(low = "#a8dadc", high = "#1d3557", name = "Year in file") +
+    ggplot2::scale_x_continuous(labels = scales::comma,
+                                expand = ggplot2::expansion(mult = c(0, .18))) +
+    ggplot2::labs(title = "Records per source file",
+                  subtitle = "File names do not match their contents - the year in brackets is the year of the data",
+                  x = "Rows", y = NULL) +
+    theme_desc()
+}
+
+## 3. Column_Check - every file must carry the same 17 variables
+sheet_plots$Column_Check <- {
+  d <- col_check %>%
+    dplyr::mutate(status = ifelse(identical_names, "Identical to reference", "Different"),
+                  source_file = factor(source_file, levels = rev(sort(source_file))))
+  ggplot2::ggplot(d, ggplot2::aes(n_columns, source_file, fill = status)) +
+    ggplot2::geom_col(width = .72) +
+    ggplot2::geom_text(ggplot2::aes(label = n_columns), hjust = -0.3, size = 3) +
+    ggplot2::scale_fill_manual(values = c("Identical to reference" = unname(pal["ok"]),
+                                          "Different" = unname(pal["warn"])), name = NULL) +
+    ggplot2::scale_x_continuous(expand = ggplot2::expansion(mult = c(0, .15))) +
+    ggplot2::labs(title = "Variable structure of every file",
+                  subtitle = paste0("All ", nrow(d), " files share the same ",
+                                    unique(d$n_columns)[1], " column names, in the same order"),
+                  x = "Number of columns", y = NULL) +
+    theme_desc()
+}
+
+## 4. Class_Check - the class each variable resolves to
+sheet_plots$Class_Check <- {
+  d <- dplyr::bind_rows(
+    class_check %>%
+      dplyr::count(class = distinct_classes, name = "n_variables") %>%
+      dplyr::mutate(stage = "As read from the CSVs"),
+    variable_overview %>%
+      dplyr::count(class = type, name = "n_variables") %>%
+      dplyr::mutate(stage = "After the single coercion step")
+  ) %>%
+    dplyr::mutate(stage = factor(stage, levels = c("As read from the CSVs",
+                                                   "After the single coercion step")))
+  ggplot2::ggplot(d, ggplot2::aes(stats::reorder(class, n_variables), n_variables,
+                                  fill = stage)) +
+    ggplot2::geom_col(width = .62) +
+    ggplot2::geom_text(ggplot2::aes(label = n_variables), vjust = -0.45, size = 3.4) +
+    ggplot2::facet_wrap(~ stage, scales = "free_x") +
+    ggplot2::scale_y_continuous(expand = ggplot2::expansion(mult = c(0, .18))) +
+    ggplot2::scale_fill_manual(values = c(unname(pal["grey"]), unname(pal["main"])),
+                               guide = "none") +
+    ggplot2::labs(title = "Column classes agree across all files",
+                  subtitle = "Every file is read as text, then coerced once - so no file can type a column differently",
+                  x = NULL, y = "Number of variables") +
+    theme_desc()
+}
+
+## 5. Missing_Values
+sheet_plots$Missing_Values <- {
+  d <- missing_tbl %>% dplyr::mutate(variable = factor(variable, levels = rev(variable)))
+  ggplot2::ggplot(d, ggplot2::aes(pct_missing, variable)) +
+    ggplot2::geom_col(fill = ifelse(d$pct_missing > 0, pal["warn"], pal["ok"]), width = .7) +
+    ggplot2::geom_text(ggplot2::aes(label = paste0(n_missing, " missing")),
+                       hjust = -0.1, size = 3, colour = "grey30") +
+    ggplot2::scale_x_continuous(limits = c(0, max(1, max(d$pct_missing) * 1.4)),
+                                labels = function(x) paste0(x, "%")) +
+    ggplot2::labs(title = "Missing values by variable",
+                  subtitle = paste0("Complete dataset: ", sum(missing_tbl$n_missing),
+                                    " missing cells across ", scales::comma(nrow(fao)), " rows"),
+                  x = "% missing", y = NULL) +
+    theme_desc()
+}
+
+## 6. Duplicate_Check
+sheet_plots$Duplicate_Check <- {
+  d <- dup_tbl %>%
+    dplyr::mutate(
+      status = ifelse(n_duplicates == 0, "No duplication",
+                      "Expected: same shipment restated in another unit"),
+      check  = stringr::str_wrap(check, 38),
+      check  = factor(check, levels = rev(check)))
+  ggplot2::ggplot(d, ggplot2::aes(n_duplicates, check, fill = status)) +
+    ggplot2::geom_col(width = .6) +
+    ggplot2::geom_text(ggplot2::aes(label = scales::comma(n_duplicates)),
+                       hjust = -0.2, size = 3.6) +
+    ggplot2::scale_fill_manual(values = c("No duplication" = unname(pal["ok"]),
+      "Expected: same shipment restated in another unit" = unname(pal["alt"])),
+      name = NULL) +
+    ggplot2::scale_x_continuous(labels = scales::comma,
+                                limits = c(0, max(1, max(d$n_duplicates) * 1.35))) +
+    ggplot2::labs(title = "Duplicate checks",
+                  subtitle = stringr::str_wrap(paste(
+                    "No genuine duplicate exists. The third count is the same shipment restated",
+                    "in another unit (An / 1000 An / t), which the head-count filter removes."), 80),
+                  x = "Duplicated rows found", y = NULL) +
+    theme_desc()
+}
+
+## 7. Variable_Overview - distinct values per variable
+sheet_plots$Variable_Overview <- {
+  d <- variable_overview %>%
+    dplyr::arrange(n_unique) %>%
+    dplyr::mutate(variable = factor(variable, levels = variable))
+  ggplot2::ggplot(d, ggplot2::aes(n_unique, variable, fill = role)) +
+    ggplot2::geom_col(width = .72) +
+    ggplot2::geom_text(ggplot2::aes(label = scales::comma(n_unique)),
+                       hjust = -0.15, size = 3) +
+    ggplot2::scale_x_log10(labels = scales::comma,
+                           expand = ggplot2::expansion(mult = c(0, .25))) +
+    ggplot2::scale_fill_brewer(palette = "Set2", name = NULL) +
+    ggplot2::labs(title = "Distinct values per variable",
+                  subtitle = "Log scale - shows which columns are constants, keys or measures",
+                  x = "Distinct values (log scale)", y = NULL) +
+    theme_desc()
+}
+
+## 8. Categorical_Freq
+sheet_plots$Categorical_Freq <- {
+  d <- categorical_freq %>%
+    dplyr::group_by(variable) %>%
+    dplyr::slice_max(n, n = 8, with_ties = FALSE) %>%
+    dplyr::ungroup() %>%
+    dplyr::mutate(short = stringr::str_trunc(level, 26),
+                  key   = paste(variable, level, sep = " | "),
+                  key   = stats::reorder(key, n))
+  key_labels <- stats::setNames(d$short, as.character(d$key))
+  ggplot2::ggplot(d, ggplot2::aes(n, key)) +
+    ggplot2::geom_col(fill = pal["main"], width = .7) +
+    ggplot2::scale_y_discrete(labels = key_labels) +
+    ggplot2::scale_x_continuous(labels = scales::label_number(scale_cut =
+                                  scales::cut_short_scale()),
+                                expand = ggplot2::expansion(mult = c(0, .08)),
+                                n.breaks = 4) +
+    ggplot2::facet_wrap(~ variable, scales = "free", ncol = 3) +
+    ggplot2::labs(title = "Frequency of each level of the categorical variables",
+                  subtitle = "Up to eight most frequent levels per variable",
+                  x = "Records", y = NULL) +
+    theme_desc(10) +
+    ggplot2::theme(plot.margin = ggplot2::margin(10, 18, 10, 10))
+}
+
+## 9. Value_by_Element_Unit
+sheet_plots$Value_by_Element_Unit <- {
+  d <- value_by_element_unit %>%
+    dplyr::mutate(grp = paste(element, "-", unit))
+  ggplot2::ggplot(d, ggplot2::aes(stats::reorder(grp, n), n, fill = element)) +
+    ggplot2::geom_col(width = .7) +
+    ggplot2::geom_text(ggplot2::aes(label = paste0(scales::comma(n), "\nmedian ",
+                                                   scales::comma(round(median)))),
+                       hjust = -0.08, size = 3, lineheight = .95) +
+    ggplot2::coord_flip() +
+    ggplot2::scale_y_continuous(labels = scales::comma,
+                                expand = ggplot2::expansion(mult = c(0, .28))) +
+    ggplot2::scale_fill_manual(values = c("Import Quantity" = unname(pal["main"]),
+                                          "Export Quantity" = unname(pal["alt"])),
+                               name = NULL) +
+    ggplot2::labs(title = "Records and typical size by element and unit",
+                  subtitle = "Head (An), thousand head (1000 An) and tonnes (t) restate the same shipments",
+                  x = NULL, y = "Records") +
+    theme_desc()
+}
+
+## 10. Value_by_Year - distribution of the reported value through time
+sheet_plots$Value_by_Year <- {
+  d <- value_by_year %>%
+    dplyr::select(year, q1, median, q3, mean) %>%
+    tidyr::pivot_longer(c(median, mean), names_to = "stat", values_to = "value") %>%
+    dplyr::mutate(stat = dplyr::recode(stat,
+      median = "Median (with inter-quartile band)", mean = "Mean"))
+  ggplot2::ggplot(d, ggplot2::aes(year, value)) +
+    ggplot2::geom_ribbon(data = dplyr::filter(d, stat != "Mean"),
+                         ggplot2::aes(ymin = q1, ymax = q3),
+                         fill = pal["main"], alpha = .20) +
+    ggplot2::geom_line(ggplot2::aes(colour = stat), linewidth = .9) +
+    ggplot2::geom_point(ggplot2::aes(colour = stat), size = 1.9) +
+    ggplot2::facet_wrap(~ stat, scales = "free_y", ncol = 1) +
+    ggplot2::scale_x_continuous(breaks = value_by_year$year) +
+    ggplot2::scale_y_continuous(labels = scales::comma) +
+    ggplot2::scale_colour_manual(values = stats::setNames(
+      c(unname(pal["alt"]), unname(pal["main"])),
+      c("Mean", "Median (with inter-quartile band)")), guide = "none") +
+    ggplot2::labs(title = "Reported quantity per record, by year",
+                  subtitle = "All units pooled - the mean is pulled up by a few very large poultry consignments",
+                  x = NULL, y = "Value per record") +
+    theme_desc()
+}
+
+## 11. Head_by_Species
+sheet_plots$Head_by_Species <- {
+  d <- head_by_species %>%
+    dplyr::mutate(item = stats::reorder(item, sum))
+  ggplot2::ggplot(d, ggplot2::aes(sum, item)) +
+    ggplot2::geom_col(fill = pal["main"], width = .72) +
+    ggplot2::geom_text(ggplot2::aes(label = paste0(scales::label_number(scale_cut =
+                         scales::cut_short_scale())(sum), "  (", scales::comma(n), " mov.)")),
+                       hjust = -0.06, size = 3) +
+    ggplot2::scale_x_continuous(labels = scales::label_number(scale_cut =
+                                  scales::cut_short_scale()),
+                                expand = ggplot2::expansion(mult = c(0, .3))) +
+    ggplot2::labs(title = "Animals moved by species, 2005-2021",
+                  subtitle = "Total head over all movements; movement count in brackets",
+                  x = "Head", y = NULL) +
+    theme_desc()
+}
+
+## 12. Head_by_Year
+sheet_plots$Head_by_Year <- {
+  ggplot2::ggplot(head_by_year, ggplot2::aes(year, sum)) +
+    ggplot2::geom_col(fill = pal["main"], width = .68) +
+    ggplot2::geom_vline(xintercept = 2019, linetype = "22", colour = pal["warn"]) +
+    ggplot2::annotate("text", x = 2019, y = max(head_by_year$sum) * .96,
+                      label = "2019 not in the data", colour = pal["warn"],
+                      angle = 90, vjust = -0.5, size = 3) +
+    ggplot2::scale_x_continuous(breaks = head_by_year$year) +
+    ggplot2::scale_y_continuous(labels = scales::label_number(scale_cut =
+                                  scales::cut_short_scale())) +
+    ggplot2::labs(title = "Total animals moved per year",
+                  subtitle = "Sum of head over all species and all routes",
+                  x = NULL, y = "Head") +
+    theme_desc()
+}
+
+## 13. Year_Summary
+sheet_plots$Year_Summary <- {
+  d <- year_summary %>%
+    dplyr::select(year, n_movements, n_origins, n_destinations, n_species) %>%
+    tidyr::pivot_longer(-year, names_to = "metric", values_to = "value") %>%
+    dplyr::mutate(metric = dplyr::recode(metric,
+      n_movements = "Movements recorded", n_origins = "Exporting countries",
+      n_destinations = "Importing countries", n_species = "Species traded"))
+  ggplot2::ggplot(d, ggplot2::aes(year, value, colour = metric)) +
+    ggplot2::geom_vline(xintercept = 2019, linetype = "22", colour = "grey65") +
+    ggplot2::geom_line(linewidth = .9) + ggplot2::geom_point(size = 1.8) +
+    ggplot2::facet_wrap(~ metric, scales = "free_y", ncol = 2) +
+    ggplot2::scale_x_continuous(breaks = seq(2005, 2021, 4)) +
+    ggplot2::scale_y_continuous(labels = scales::comma) +
+    ggplot2::scale_colour_brewer(palette = "Dark2", guide = "none") +
+    ggplot2::labs(title = "Coverage of the network through time",
+                  subtitle = "Dashed line marks 2019, which is absent from the source files - the series joins 2018 to 2020",
+                  x = NULL, y = NULL) +
+    theme_desc()
+}
+
+## 14. Country_Summary
+sheet_plots$Country_Summary <- {
+  d <- country_summary %>%
+    dplyr::mutate(total = out_movements + in_movements) %>%
+    dplyr::slice_max(total, n = 20) %>%
+    dplyr::mutate(country = lab_of(country),
+                  country = stats::reorder(country, total)) %>%
+    dplyr::select(country, `Movements out` = out_movements,
+                  `Movements in` = in_movements) %>%
+    tidyr::pivot_longer(-country, names_to = "direction", values_to = "n")
+  ggplot2::ggplot(d, ggplot2::aes(n, country, fill = direction)) +
+    ggplot2::geom_col(width = .74) +
+    ggplot2::scale_fill_manual(values = c("Movements out" = unname(pal["alt"]),
+                                          "Movements in"  = unname(pal["main"])), name = NULL) +
+    ggplot2::scale_x_continuous(labels = scales::comma) +
+    ggplot2::labs(title = "Twenty busiest countries",
+                  subtitle = "Movements recorded as origin and as destination, 2005-2021",
+                  x = "Movements", y = NULL) +
+    theme_desc()
+}
+
+## 15. Movement_Reporting
+sheet_plots$Movement_Reporting <- {
+  d <- janitor_tbl %>%
+    dplyr::mutate(pct = n_movements / sum(n_movements),
+                  reported_by = stats::reorder(reported_by, n_movements))
+  ggplot2::ggplot(d, ggplot2::aes(n_movements, reported_by, fill = reported_by)) +
+    ggplot2::geom_col(width = .62) +
+    ggplot2::geom_text(ggplot2::aes(label = paste0(scales::comma(n_movements), "  (",
+                                                   scales::percent(pct, accuracy = .1), ")")),
+                       hjust = -0.06, size = 3.4) +
+    ggplot2::scale_x_continuous(labels = scales::comma,
+                                expand = ggplot2::expansion(mult = c(0, .3))) +
+    ggplot2::scale_fill_manual(values = c("both sides" = unname(pal["ok"]),
+                                          "exporter only" = unname(pal["alt"]),
+                                          "importer only" = unname(pal["main"])),
+                               guide = "none") +
+    ggplot2::labs(title = "Who reported each movement",
+                  subtitle = "Nearly half of all movements were reported by both trading partners and had to be collapsed",
+                  x = "Movements", y = NULL) +
+    theme_desc()
+}
+
+## 16. Network_Summary_All
+sheet_plots$Network_Summary_All <- {
+  d <- stats_all %>%
+    dplyr::select(-network) %>%
+    tidyr::pivot_longer(dplyr::everything(), names_to = "metric", values_to = "value") %>%
+    dplyr::mutate(
+      panel = ifelse(metric %in% c("density", "reciprocity", "transitivity"),
+                     "Proportions (0-1)", "Counts"),
+      metric = dplyr::recode(metric,
+        n_nodes = "Countries", n_edges = "Routes", density = "Density",
+        reciprocity = "Reciprocity", transitivity = "Transitivity",
+        mean_in_degree = "Mean in-degree", mean_out_degree = "Mean out-degree",
+        max_in_degree = "Max in-degree", max_out_degree = "Max out-degree",
+        diameter = "Diameter", n_components_weak = "Weak components"))
+  ggplot2::ggplot(d, ggplot2::aes(value, stats::reorder(metric, value), colour = panel)) +
+    ggplot2::geom_segment(ggplot2::aes(x = 0.1, xend = value, yend = metric),
+                          linewidth = .9) +
+    ggplot2::geom_point(size = 3.6) +
+    ggplot2::geom_text(ggplot2::aes(label = ifelse(value < 1, round(value, 3),
+                                                   scales::comma(round(value, 1)))),
+                       hjust = -0.35, size = 3.2, colour = "grey20") +
+    ggplot2::scale_x_log10(labels = scales::comma,
+                           expand = ggplot2::expansion(mult = c(0.02, .22))) +
+    ggplot2::scale_colour_manual(values = c("Counts" = unname(pal["main"]),
+                                            "Proportions (0-1)" = unname(pal["alt"])),
+                                 name = NULL) +
+    ggplot2::labs(title = "Structure of the combined network",
+                  subtitle = "All species, all years - log scale, so proportions and counts fit on one axis",
+                  x = "Value (log scale)", y = NULL) +
+    theme_desc()
+}
+
+## 17. Network_Summary_Spp
+sheet_plots$Network_Summary_Spp <- {
+  ggplot2::ggplot(species_stats,
+                  ggplot2::aes(n_nodes, n_edges, size = density, colour = reciprocity)) +
+    ggplot2::geom_point(alpha = .85) +
+    ggrepel::geom_text_repel(ggplot2::aes(label = network), size = 3,
+                             colour = "grey20", seed = 1, max.overlaps = 30) +
+    ggplot2::scale_size_continuous(range = c(2, 10), name = "Density") +
+    ggplot2::scale_colour_gradient(low = "#a8dadc", high = "#1d3557", name = "Reciprocity") +
+    ggplot2::scale_y_continuous(labels = scales::comma) +
+    ggplot2::labs(title = "Size and shape of each species network",
+                  subtitle = "Countries involved vs routes used; point size = density",
+                  x = "Countries in the network", y = "Directed routes") +
+    theme_desc()
+}
+
+## 18. Centrality_All
+sheet_plots$Centrality_All <- {
+  d <- cent_all %>% dplyr::mutate(lbl = lab_of(country))
+  top <- d %>% dplyr::slice_max(total_degree, n = 14, with_ties = FALSE)
+  ggplot2::ggplot(d, ggplot2::aes(out_degree, in_degree)) +
+    ggplot2::geom_abline(slope = 1, intercept = 0, linetype = "22", colour = "grey70") +
+    ggplot2::geom_point(ggplot2::aes(colour = total_degree, size = total_degree), alpha = .85) +
+    ggrepel::geom_text_repel(data = top, ggplot2::aes(label = lbl), size = 3,
+                             colour = "grey15", seed = 1, max.overlaps = 30) +
+    ggplot2::scale_colour_gradient(low = "#ffd166", high = "#7f1d3f", name = "Total degree") +
+    ggplot2::scale_size_continuous(range = c(1.2, 7), guide = "none") +
+    ggplot2::scale_x_continuous(expand = ggplot2::expansion(mult = .09)) +
+    ggplot2::scale_y_continuous(expand = ggplot2::expansion(mult = .09)) +
+    ggplot2::labs(title = "Exporting reach against importing reach",
+                  subtitle = "Each point is a country; above the dashed line = imports from more partners than it exports to",
+                  x = "Out-degree (countries supplied)", y = "In-degree (countries supplied by)") +
+    theme_desc()
+}
+
+## 19. Centrality_by_Species
+sheet_plots$Centrality_by_Species <- {
+  top_c <- cent_all %>% dplyr::slice_max(total_degree, n = 20, with_ties = FALSE) %>%
+    dplyr::pull(country)
+  d <- species_cent %>%
+    dplyr::filter(country %in% top_c) %>%
+    dplyr::mutate(lbl = lab_of(country))
+  ord <- d %>% dplyr::group_by(lbl) %>% dplyr::summarise(s = sum(total_degree)) %>%
+    dplyr::arrange(s) %>% dplyr::pull(lbl)
+  sp_ord <- d %>% dplyr::group_by(species) %>% dplyr::summarise(s = sum(total_degree)) %>%
+    dplyr::arrange(dplyr::desc(s)) %>% dplyr::pull(species)
+  d <- d %>% dplyr::mutate(lbl = factor(lbl, levels = ord),
+                           species = factor(species, levels = sp_ord))
+  ggplot2::ggplot(d, ggplot2::aes(species, lbl, fill = total_degree)) +
+    ggplot2::geom_tile(colour = "white", linewidth = .4) +
+    ggplot2::scale_fill_gradient(low = "#f1faee", high = "#1d3557", name = "Total degree") +
+    ggplot2::labs(title = "Total degree of the twenty most connected countries, by species",
+                  subtitle = "Darker = trades that species with more partners",
+                  x = NULL, y = NULL) +
+    theme_desc() +
+    ggplot2::theme(axis.text.x = ggplot2::element_text(angle = 45, hjust = 1),
+                   panel.grid = ggplot2::element_blank())
+}
+
+## 20. Top_Edges_All
+sheet_plots$Top_Edges_All <- {
+  d <- edges_all %>%
+    dplyr::slice_max(weight, n = 20, with_ties = FALSE) %>%
+    dplyr::mutate(route = paste(lab_of(from), "->", lab_of(to)),
+                  route = stats::reorder(route, weight))
+  ggplot2::ggplot(d, ggplot2::aes(weight, route, fill = n_species)) +
+    ggplot2::geom_col(width = .74) +
+    ggplot2::geom_text(ggplot2::aes(label = weight), hjust = -0.25, size = 3) +
+    ggplot2::scale_fill_gradient(low = "#a8dadc", high = "#1d3557", name = "Species on route") +
+    ggplot2::scale_x_continuous(expand = ggplot2::expansion(mult = c(0, .12))) +
+    ggplot2::labs(title = "Twenty most frequently used routes",
+                  subtitle = "Weight = number of distinct species-year movements on that route",
+                  x = "Movement frequency", y = NULL) +
+    theme_desc()
+}
+
+stopifnot(setequal(names(sheet_plots), names(wb_sheets)))
+
+# chart size per sheet (inches)
+chart_size <- list(
+  Categorical_Freq      = c(11, 7.5),
+  Year_Summary          = c(9, 6),
+  Centrality_by_Species = c(9.5, 7),
+  Network_Summary_All   = c(10, 5),
+  File_Inventory        = c(9.5, 5.5),
+  Variable_Overview     = c(9.5, 5.5),
+  Country_Summary       = c(9, 6)
+)
+size_of <- function(nm) if (!is.null(chart_size[[nm]])) chart_size[[nm]] else c(9, 5)
+
+chart_files <- vapply(names(sheet_plots), function(nm) {
+  wh <- size_of(nm)
+  f  <- file.path(chart_dir, paste0(nm, ".png"))
+  ggplot2::ggsave(f, sheet_plots[[nm]], width = wh[1], height = wh[2], dpi = 150, bg = "white")
+  f
+}, character(1))
+```
+
+## Writing the workbook
+
+Each sheet holds its table on the left and its figure to the right of the data.
+
+```{r export-xlsx-write}
+xlsx_path <- file.path(tab_dir, "Descriptive_Statistics.xlsx")
+
+wb  <- openxlsx::createWorkbook()
+hdr <- openxlsx::createStyle(textDecoration = "bold", fgFill = "#1f6f8b",
+                             fontColour = "white", halign = "left", border = "bottom")
+
+for (nm in names(wb_sheets)) {
+  df <- wb_sheets[[nm]]
+  openxlsx::addWorksheet(wb, nm)
+  openxlsx::writeData(wb, nm, df, headerStyle = hdr)
+  openxlsx::freezePane(wb, nm, firstRow = TRUE)
+  openxlsx::setColWidths(wb, nm, cols = seq_len(ncol(df)),
+                         widths = pmin(60, pmax(10, nchar(names(df)) + 4)))
+  wh <- size_of(nm)
+  openxlsx::insertImage(wb, nm, chart_files[[nm]],
+                        width = wh[1], height = wh[2],
+                        startCol = ncol(df) + 2, startRow = 2)
+}
+
+openxlsx::saveWorkbook(wb, xlsx_path, overwrite = TRUE)
+
+cat("Workbook written to", xlsx_path, "\n",
+    length(wb_sheets), "sheets, each with its own chart:\n  ",
+    paste(names(wb_sheets), collapse = ", "), "\n")
+```
+
+```{r session}
+sessionInfo()
+```
